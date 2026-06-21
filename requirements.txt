@@ -1,0 +1,7 @@
+transformer-lens>=2.0
+einops
+datasets
+matplotlib
+tqdm
+jaxtyping
+typeguard

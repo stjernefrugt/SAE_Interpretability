@@ -1,0 +1,22 @@
+# Large cached files
+results/
+activations_cache/
+*.pt
+*.npy
+*.mmap
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Model weights
+*.safetensors
