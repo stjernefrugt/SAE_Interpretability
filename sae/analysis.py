@@ -263,3 +263,149 @@ def compare_interpretability(
 
     lines.append("=" * 70)
     return "\n".join(lines)
+
+
+@torch.no_grad()
+def logit_lens(
+    sae,
+    model,
+    feature_indices: list[int] | None = None,
+    top_k: int = 15,
+) -> dict:
+    """
+    Project SAE decoder directions onto the model's unembedding matrix.
+
+    For each feature, this reveals what tokens the feature "wants to predict"
+    by computing: logits_i = W_dec[i] @ W_U
+
+    This is the most scalable method for semantic feature assignment — it
+    runs in O(d_sae * vocab_size) and requires no dataset examples.
+
+    Args:
+        sae: Trained SparseAutoencoder
+        model: HookedTransformer model (provides W_U unembedding)
+        feature_indices: Which features to analyze (default: all alive features)
+        top_k: Number of top/bottom tokens to return per feature
+
+    Returns:
+        Dict mapping feature_idx → {top_tokens, top_logits, bottom_tokens, bottom_logits}
+    """
+    # Get unembedding matrix: (d_model, vocab_size)
+    W_U = model.W_U  # shape: (d_model, d_vocab)
+
+    # Get decoder weights: (d_sae, d_model)
+    W_dec = sae.W_dec.data.cpu()
+
+    if feature_indices is None:
+        feature_indices = list(range(sae.d_sae))
+
+    results = {}
+    for feat_idx in feature_indices:
+        # Project decoder direction onto vocabulary
+        # decoder_dir: (d_model,) @ W_U: (d_model, d_vocab) → (d_vocab,)
+        decoder_dir = W_dec[feat_idx].to(W_U.device)
+        logits = decoder_dir @ W_U  # (d_vocab,)
+
+        # Top tokens (feature promotes these)
+        top_vals, top_ids = logits.topk(top_k)
+        top_tokens = [model.tokenizer.decode(t.item()) for t in top_ids]
+
+        # Bottom tokens (feature suppresses these)
+        bot_vals, bot_ids = logits.topk(top_k, largest=False)
+        bot_tokens = [model.tokenizer.decode(t.item()) for t in bot_ids]
+
+        results[feat_idx] = {
+            "top_tokens": top_tokens,
+            "top_logits": top_vals.cpu(),
+            "bottom_tokens": bot_tokens,
+            "bottom_logits": bot_vals.cpu(),
+        }
+
+    return results
+
+
+@torch.no_grad()
+def activation_patching(
+    sae,
+    model,
+    text: str,
+    feature_idx: int,
+    layer: int = 6,
+) -> dict:
+    """
+    Measure the causal effect of a single SAE feature via activation patching.
+
+    Method:
+    1. Run model normally, get output logits
+    2. Run model with hook: at the target layer, replace activation with
+       SAE reconstruction MINUS the target feature
+    3. Measure KL divergence between original and patched outputs
+
+    This gives causal evidence of what a feature does — not just correlation.
+
+    Args:
+        sae: Trained SparseAutoencoder
+        model: HookedTransformer
+        text: Input text to analyze
+        feature_idx: Which SAE feature to ablate
+        layer: Which layer the SAE was trained on
+
+    Returns:
+        Dict with kl_divergence per position, original/patched top predictions
+    """
+    import torch.nn.functional as F
+
+    device = next(model.parameters()).device
+    tokens = model.to_tokens(text).to(device)
+
+    hook_name = f"blocks.{layer}.hook_resid_post"
+
+    # Run normally
+    original_logits = model(tokens)  # (1, seq_len, vocab)
+
+    # Run with feature ablation hook
+    def ablate_feature_hook(activation, hook):
+        # activation shape: (batch, seq_len, d_model)
+        batch_size, seq_len, d_model = activation.shape
+        flat = activation.reshape(-1, d_model)
+
+        # Encode with SAE
+        features = sae.encode(flat)
+        # Zero out target feature
+        features[:, feature_idx] = 0.0
+        # Reconstruct without this feature
+        reconstructed = sae.decode(features)
+
+        return reconstructed.reshape(batch_size, seq_len, d_model)
+
+    patched_logits = model.run_with_hooks(
+        tokens,
+        fwd_hooks=[(hook_name, ablate_feature_hook)],
+    )
+
+    # KL divergence per position
+    original_probs = F.softmax(original_logits[0], dim=-1)
+    patched_probs = F.softmax(patched_logits[0], dim=-1)
+    kl_div = (original_probs * (original_probs.log() - patched_probs.log())).sum(dim=-1)
+
+    # Top predictions at highest-KL position
+    max_kl_pos = kl_div.argmax().item()
+    orig_top5 = original_probs[max_kl_pos].topk(5)
+    patched_top5 = patched_probs[max_kl_pos].topk(5)
+
+    token_strs = [model.tokenizer.decode(t.item()) for t in tokens[0]]
+
+    return {
+        "kl_divergence": kl_div.cpu(),
+        "max_kl_position": max_kl_pos,
+        "max_kl_token": token_strs[max_kl_pos] if max_kl_pos < len(token_strs) else "",
+        "tokens": token_strs,
+        "original_top5": {
+            "tokens": [model.tokenizer.decode(t.item()) for t in orig_top5.indices],
+            "probs": orig_top5.values.cpu(),
+        },
+        "patched_top5": {
+            "tokens": [model.tokenizer.decode(t.item()) for t in patched_top5.indices],
+            "probs": patched_top5.values.cpu(),
+        },
+    }
